@@ -172,9 +172,9 @@ pub struct Parser<R: Read> {
 /// ```
 pub fn parse_path<P, F, O>(path: Option<P>, func: F) -> Result<O>
         where P: AsRef<Path>,
-              F: FnOnce(Parser<&mut dyn Read>) -> O
+              F: FnOnce(Parser<&mut Read>) -> O
 {
-    let mut reader: Box<dyn Read + Send> = match path {
+    let mut reader: Box<Read + Send> = match path {
         None => {
             Box::new(std::io::stdin())
         },
@@ -263,8 +263,8 @@ impl<R: Read> RecordRefIter<R> {
     }
 
     pub fn advance(&mut self) -> Result<()> {
-        let buffer = &mut self.parser.buffer;
-        let reader = &mut self.parser.reader;
+        let mut buffer = &mut self.parser.buffer;
+        let mut reader = &mut self.parser.reader;
         if let Some(len) = self.current_length.take() {
             buffer.consume(len);
         }
@@ -517,7 +517,7 @@ impl<R: Read> Parser<R> {
             S: FromIterator<O>,
             O: Send + 'static,
             F: Send + Sync + 'static,
-            F: Fn(Box<dyn Iterator<Item=RecordSet>>) -> O,
+            F: Fn(Box<Iterator<Item=RecordSet>>) -> O,
     {
         let mut senders: Vec<SyncSender<_>> = vec![];
         let mut threads: Vec<thread::JoinHandle<_>> = vec![];
