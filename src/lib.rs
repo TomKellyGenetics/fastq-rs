@@ -128,6 +128,9 @@ pub use thread_reader::thread_reader;
 pub use records::{RefRecord, Record, OwnedRecord};
 use records::{IdxRecord, IdxRecordResult};
 
+#[cfg(fuzzing)]
+const BUFSIZE: usize = 64;
+#[cfg(not(fuzzing))]
 const BUFSIZE: usize = 68 * 1024;
 
 
@@ -330,12 +333,8 @@ impl IdxRecord {
         if buffer.len() == 0 {
             return Ok(IdxRecordResult::EmptyBuffer);
         }
-
-#[cfg(fuzzing)]
-const BUFSIZE: usize = 64;
-#[cfg(not(fuzzing))]
-const BUFSIZE: usize = 68 * 1024;
-
+    }
+}
 
 /// Parser for fastq files.
 pub struct Parser<R: Read> {
