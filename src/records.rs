@@ -45,10 +45,12 @@ pub struct RefRecord<'a> {
 /// A fastq record that ownes its data arrays.
 #[derive(Debug)]
 pub struct OwnedRecord {
-    pub head: Vec<u8>,
-    pub seq: Vec<u8>,
-    pub sep: Option<Vec<u8>>,
-    pub qual: Vec<u8>,
+    // (start, stop), but might include \r at the end
+    head: usize,
+    seq: usize,
+    sep: usize,
+    qual: usize,
+    data: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -112,20 +114,8 @@ impl Record for OwnedRecord {
     }
 
     fn write<W: Write>(&self, writer: &mut W) -> Result<usize> {
-        let mut written = 0;
-        written += writer.write(b"@")?;
-        written += writer.write(self.head())?;
-        written += writer.write(b"\n")?;
-        written += writer.write(self.seq())?;
-        written += writer.write(b"\n")?;
-        match self.sep {
-            Some(ref s) => { written += writer.write(s)? }
-            None => { written += writer.write(b"+")? }
-        }
-        written += writer.write(b"\n")?;
-        written += writer.write(self.qual())?;
-        written += writer.write(b"\n")?;
-        Ok(written)
+        writer.write_all(&self.data)?;
+	Ok(self.data.len())
     }
 }
 
@@ -169,10 +159,12 @@ impl<'a> RefRecord<'a> {
     /// Copy the borrowed data array and return an owned record.
     pub fn to_owned_record(&self) -> OwnedRecord {
         OwnedRecord {
-            seq: self.seq().to_vec(),
-            qual: self.qual().to_vec(),
-            head: self.head().to_vec(),
-            sep: Some(trim_winline(&self.data[self.seq + 1..self.sep]).to_vec())
+            head: self.head,
+            seq: self.seq,
+            sep: self.sep,
+            qual: self.qual,
+ 
+            data: self.data.to_vec(),
         }
     }
 }
