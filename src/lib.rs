@@ -60,10 +60,10 @@
 //! ```rust,no_run
 //! use fastq::{parse_path, Record};
 //! use std::env::args;
-//! use parasailors as align;
+//! use bio::alignment::pairwise::*;
 //!
 //! extern crate fastq;
-//! extern crate parasailors;
+//! extern crate bio;
 //!
 //! fn main() {
 //!     let filename = args().nth(1);
@@ -78,13 +78,16 @@
 //!         let results: Vec<usize> = parser.parallel_each(nthreads, |record_sets| {
 //!             // we can initialize thread local variables here.
 //!             let adapter = b"AATGATACGGCGACCACCGAGATCTACACTCTTTCCCTACACGACGCTCTTCCGATCT";
-//!             let matrix = align::Matrix::new(align::MatrixType::Identity);
-//!             let profile = align::Profile::new(adapter, &matrix);
+//! 
+//!             let score = |a: u8, b: u8| if a == b {1i32} else {-1i32};
+//!             let mut aligner = Aligner::new(-5, -1, &score);
+//!
 //!             let mut thread_total = 0;
 //!
 //!             for record_set in record_sets {
 //!                 for record in record_set.iter() {
-//!                     let score = align::local_alignment_score(&profile, record.seq(), 5, 1);
+//!                     let alignment = aligner.semiglobal(adapter, record.seq());
+//!                     let score = alignment.score;
 //!                     if score > 8 {
 //!                         thread_total += 1;
 //!                     }
@@ -111,11 +114,10 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::Arc;
 use std::iter::FromIterator;
 use std::path::Path;
-use lz4::Decoder;
+use memchr::memchr;
 use flate2::read::MultiGzDecoder;
 
 extern crate memchr;
-extern crate lz4;
 extern crate flate2;
 
 mod thread_reader;
@@ -126,6 +128,208 @@ pub use thread_reader::thread_reader;
 pub use records::{RefRecord, Record, OwnedRecord};
 use records::{IdxRecord, IdxRecordResult};
 
+const BUFSIZE: usize = 68 * 1024;
+
+
+/// Trait to be implemented by types that represent fastq records.
+pub trait Record {
+    /// Return the fastq sequence as byte slice
+    fn seq(&self) -> &[u8];
+    /// Return the id-line of the record as byte slice
+    fn head(&self) -> &[u8];
+    /// Return the quality of the bases as byte slice
+    fn qual(&self) -> &[u8];
+    /// Write the record to a writer
+    fn write<W: Write>(&self, writer: &mut W) -> Result<usize>;
+
+    /// Return true if the sequence contains only A, C, T and G.
+    ///
+    /// FIXME This might be much faster with a [bool; 256] array
+    /// or using some simd instructions (eg with the jetscii crate).
+    fn validate_dna(&self) -> bool {
+        self.seq().iter().all(|&x| x == b'A' || x == b'C' || x == b'T' || x == b'G')
+    }
+
+    /// Return true if the sequence contains only A, C, T, G and N.
+    ///
+    /// FIXME This might be much faster with a [bool; 256] array
+    /// or using some simd instructions (eg with the jetscii crate).
+    fn validate_dnan(&self) -> bool {
+        self.seq().iter().all(|&x| x == b'A' || x == b'C' || x == b'T' || x == b'G' || x == b'N')
+    }
+}
+
+
+/// A fastq record that borrows data from an array.
+#[derive(Debug)]
+pub struct RefRecord<'a> {
+    // (start, stop), but might include \r at the end
+    head: usize,
+    seq: usize,
+    sep: usize,
+    qual: usize,
+    data: &'a [u8],
+}
+
+/// A fastq record that ownes its data arrays.
+#[derive(Debug)]
+pub struct OwnedRecord {
+    // (start, stop), but might include \r at the end
+    head: usize,
+    seq: usize,
+    sep: usize,
+    qual: usize,
+    data: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct IdxRecord {
+    head: usize,
+    seq: usize,
+    sep: usize,
+    qual: usize,
+    data: (usize, usize),
+}
+
+
+/// Remove a final '\r' from a byte slice
+#[inline]
+fn trim_winline(line: &[u8]) -> &[u8] {
+    if let Some((&b'\r', remaining)) = line.split_last() {
+        remaining
+    } else {
+        line
+    }
+}
+
+
+impl<'a> Record for RefRecord<'a> {
+    #[inline]
+    fn head(&self) -> &[u8] {
+        // skip the '@' at the beginning
+        trim_winline(&self.data[1 .. self.head])
+    }
+
+    #[inline]
+    fn seq(&self) -> &[u8] {
+        trim_winline(&self.data[self.head + 1 .. self.seq])
+    }
+
+    #[inline]
+    fn qual(&self) -> &[u8] {
+        trim_winline(&self.data[self.sep + 1 .. self.qual])
+    }
+
+    #[inline]
+    fn write<W: Write>(&self, writer: &mut W) -> Result<usize> {
+        writer.write_all(&self.data)?;
+        Ok(self.data.len())
+    }
+}
+
+
+impl Record for OwnedRecord {
+    #[inline]
+    fn head(&self) -> &[u8] {
+        // skip the '@' at the beginning
+        trim_winline(&self.data[1 .. self.head])
+    }
+
+    #[inline]
+    fn seq(&self) -> &[u8] {
+        trim_winline(&self.data[self.head + 1 .. self.seq])
+    }
+
+    #[inline]
+    fn qual(&self) -> &[u8] {
+        trim_winline(&self.data[self.sep + 1 .. self.qual])
+    }
+
+    #[inline]
+    fn write<W: Write>(&self, writer: &mut W) -> Result<usize> {
+        writer.write_all(&self.data)?;
+        Ok(self.data.len())
+    }
+}
+
+
+enum IdxRecordResult {
+    Incomplete,
+    EmptyBuffer,
+    Record(IdxRecord),
+}
+
+
+#[inline]
+fn read_header(buffer: &[u8]) -> Result<Option<usize>> {
+    match buffer.first() {
+        None => { Ok(None) },
+        Some(&b'@') => {
+            Ok(memchr(b'\n', buffer))
+        },
+        Some(_) => {
+            return Err(Error::new(ErrorKind::InvalidData,
+                                  "Fastq headers must start with '@'"))
+        }
+    }
+}
+
+
+#[inline]
+fn read_sep(buffer: &[u8]) -> Result<Option<usize>> {
+    match buffer.first() {
+        None => { return Ok(None) },
+        Some(&b'+') => { Ok(memchr(b'\n', buffer)) },
+        Some(_) => {
+            return Err(Error::new(ErrorKind::InvalidData,
+                                  "Sequence and quality not separated by +"));
+        }
+    }
+}
+
+
+impl<'a> RefRecord<'a> {
+    /// Copy the borrowed data array and return an owned record.
+    pub fn to_owned_record(&self) -> OwnedRecord {
+        OwnedRecord {
+            head: self.head,
+            seq: self.seq,
+            sep: self.sep,
+            qual: self.qual,
+            data: self.data.to_vec(),
+        }
+    }
+}
+
+impl IdxRecord {
+    #[inline]
+    fn to_ref_record<'a>(&self, buffer: &'a [u8]) -> RefRecord<'a> {
+        let data = &buffer[self.data.0..self.data.1];
+        let datalen = data.len();
+        debug_assert!(datalen == self.data.1 - self.data.0);
+
+        debug_assert!(self.head < datalen);
+        debug_assert!(self.qual < datalen);
+        debug_assert!(self.seq < datalen);
+        debug_assert!(self.sep < datalen);
+        debug_assert!(self.head < self.seq);
+        debug_assert!(self.seq < self.sep);
+        debug_assert!(self.sep < self.qual);
+
+        RefRecord {
+            data: data,
+            head: self.head,
+            seq: self.seq,
+            sep: self.sep,
+            qual: self.qual,
+        }
+    }
+
+    #[inline]
+    fn from_buffer(buffer: &[u8]) -> Result<IdxRecordResult> {
+        if buffer.len() == 0 {
+            return Ok(IdxRecordResult::EmptyBuffer);
+        }
 
 #[cfg(fuzzing)]
 const BUFSIZE: usize = 64;
@@ -185,18 +389,12 @@ pub fn parse_path<P, F, O>(path: Option<P>, func: F) -> Result<O>
     let mut magic_bytes = [0u8; 4];
     reader.read_exact(&mut magic_bytes)?;
     let mut reader = Cursor::new(magic_bytes.to_vec()).chain(reader);
-    if unsafe { std::mem::transmute::<_, u32>(magic_bytes.clone()) }.to_le() ==  0x184D2204 {
+    if &magic_bytes[..2] == b"\x1f\x8b" {
         let bufsize = 1<<22;
         let queuelen = 2;
-        return Ok(thread_reader(bufsize, queuelen, Decoder::new(reader)?, |mut reader| {
-            func(Parser::new(&mut reader))
-        }).expect("lz4 reader thread paniced"))
-    } else if &magic_bytes[..2] == b"\x1f\x8b" {
-        let bufsize = 1<<22;
-        let queuelen = 2;
-        let reader = MultiGzDecoder::new(reader);
-        return Ok(thread_reader(bufsize, queuelen, reader, |mut reader| {
-            func(Parser::new(&mut reader))
+        let reader = MultiGzDecoder::new(reader)?;
+        return Ok(thread_reader(bufsize, queuelen, reader, |reader| {
+            func(Parser::new(Box::new(reader)))
         }).expect("gzip reader thread paniced"))
     } else if magic_bytes[0] == b'@' {
         Ok(func(Parser::new(&mut reader)))
@@ -340,6 +538,43 @@ impl RecordSet {
     }
 }
 
+pub struct OwnedRecordIter<R: Read> {
+    record_set_iter: RecordSetIter<R>,
+    current_record_set: Option<RecordSet>,
+    pos: usize,
+}
+
+impl<R: Read> Iterator for OwnedRecordIter<R> {
+    type Item = OwnedRecord;
+
+    #[inline]
+    fn next(&mut self) -> Option<OwnedRecord> {
+
+        if self.current_record_set.is_none() || self.current_record_set.as_ref().unwrap().records.len() == self.pos {
+            match self.record_set_iter.next() {
+                Some(Ok(rs)) => { 
+                    self.current_record_set = Some(rs);
+                    self.pos = 0;
+                },
+                _ => {
+                    self.current_record_set = None;
+                    return None;
+                }
+            }
+        }
+
+        match self.current_record_set {
+            Some(ref rs) => {       
+                let ref idx_record = rs.records[self.pos];
+                let ref_rec = idx_record.to_ref_record(&rs.buffer);
+                self.pos += 1;
+                Some(ref_rec.to_owned_record())
+            },
+            _ => None
+        }
+    }
+}
+
 
 pub struct RecordSetItems<'a> {
     idx_records: ::std::slice::Iter<'a, IdxRecord>,
@@ -438,6 +673,16 @@ impl<R: Read> Parser<R> {
             parser: self,
             reader_at_end: false,
             num_records_guess: 100,
+        }
+    }
+
+    ///
+    pub fn owned_records(self) -> OwnedRecordIter<R> {
+        let rec_sets = self.record_sets();
+        OwnedRecordIter {
+            record_set_iter: rec_sets,
+            current_record_set: None,
+            pos: 0,
         }
     }
 
