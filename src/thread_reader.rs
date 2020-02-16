@@ -4,7 +4,7 @@ use std::io::{Result, Read, Error, ErrorKind, Cursor};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 use std::rc::Rc;
-
+use flate2::read::MultiGzDecoder;
 
 struct BufferMessage {
     buffer: Box<[u8]>,
