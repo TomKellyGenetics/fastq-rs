@@ -1,6 +1,6 @@
 [package]
 name = "fastq"
-version = "0.4.1"
+version = "0.6.0"
 authors = ["Adrian Seyboldt <adrian.seyboldt@gmail.com>"]
 description = "A parser for fastq"
 license = "MIT"
@@ -11,8 +11,10 @@ keywords = ["bio", "fastq", "parser"]
 
 [dependencies]
 memchr = ">=0.1"
-lz4 = "^1.20"
-flate2 = "^0.2.18"
+lz4 = "^1.23"
+flate2 = ">=0.2.18"
 
 [dev-dependencies]
-bio = "^0.10"
+flate2 = { version = ">=0.2.18", features = ["zlib"], default-features = false }
+parasailors = ">=0.3"
+bio = ">=0.10"

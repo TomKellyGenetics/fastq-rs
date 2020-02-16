@@ -60,10 +60,10 @@
 //! ```rust,no_run
 //! use fastq::{parse_path, Record};
 //! use std::env::args;
-//! use bio::alignment::pairwise::*;
+//! use parasailors as align;
 //!
 //! extern crate fastq;
-//! extern crate bio;
+//! extern crate parasailors;
 //!
 //! fn main() {
 //!     let filename = args().nth(1);
@@ -78,16 +78,13 @@
 //!         let results: Vec<usize> = parser.parallel_each(nthreads, |record_sets| {
 //!             // we can initialize thread local variables here.
 //!             let adapter = b"AATGATACGGCGACCACCGAGATCTACACTCTTTCCCTACACGACGCTCTTCCGATCT";
-//! 
-//!             let score = |a: u8, b: u8| if a == b {1i32} else {-1i32};
-//!             let mut aligner = Aligner::new(-5, -1, &score);
-//!
+//!             let matrix = align::Matrix::new(align::MatrixType::Identity);
+//!             let profile = align::Profile::new(adapter, &matrix);
 //!             let mut thread_total = 0;
 //!
 //!             for record_set in record_sets {
 //!                 for record in record_set.iter() {
-//!                     let alignment = aligner.semiglobal(adapter, record.seq());
-//!                     let score = alignment.score;
+//!                     let score = align::local_alignment_score(&profile, record.seq(), 5, 1);
 //!                     if score > 8 {
 //!                         thread_total += 1;
 //!                     }
@@ -108,269 +105,32 @@
 //! On my feeble 2 core laptop this ends up being bound by the alignment at ~300MB/s,
 //! but it should scale well to a larger number of cores.
 
-use std::io::{Write, Result, Read, Error, ErrorKind, Cursor};
+use std::io::{Result, Read, Error, ErrorKind, Cursor};
 use std::thread;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::Arc;
 use std::iter::FromIterator;
 use std::path::Path;
-use memchr::memchr;
+use lz4::Decoder;
 use flate2::read::MultiGzDecoder;
 
 extern crate memchr;
+extern crate lz4;
 extern crate flate2;
 
 mod thread_reader;
 mod buffer;
+mod records;
 
 pub use thread_reader::thread_reader;
+pub use records::{RefRecord, Record, OwnedRecord};
+use records::{IdxRecord, IdxRecordResult};
 
+
+#[cfg(fuzzing)]
+const BUFSIZE: usize = 64;
+#[cfg(not(fuzzing))]
 const BUFSIZE: usize = 68 * 1024;
-
-
-/// Trait to be implemented by types that represent fastq records.
-pub trait Record {
-    /// Return the fastq sequence as byte slice
-    fn seq(&self) -> &[u8];
-    /// Return the id-line of the record as byte slice
-    fn head(&self) -> &[u8];
-    /// Return the quality of the bases as byte slice
-    fn qual(&self) -> &[u8];
-    /// Write the record to a writer
-    fn write<W: Write>(&self, writer: &mut W) -> Result<usize>;
-
-    /// Return true if the sequence contains only A, C, T and G.
-    ///
-    /// FIXME This might be much faster with a [bool; 256] array
-    /// or using some simd instructions (eg with the jetscii crate).
-    fn validate_dna(&self) -> bool {
-        self.seq().iter().all(|&x| x == b'A' || x == b'C' || x == b'T' || x == b'G')
-    }
-
-    /// Return true if the sequence contains only A, C, T, G and N.
-    ///
-    /// FIXME This might be much faster with a [bool; 256] array
-    /// or using some simd instructions (eg with the jetscii crate).
-    fn validate_dnan(&self) -> bool {
-        self.seq().iter().all(|&x| x == b'A' || x == b'C' || x == b'T' || x == b'G' || x == b'N')
-    }
-}
-
-
-/// A fastq record that borrows data from an array.
-#[derive(Debug)]
-pub struct RefRecord<'a> {
-    // (start, stop), but might include \r at the end
-    head: usize,
-    seq: usize,
-    sep: usize,
-    qual: usize,
-    data: &'a [u8],
-}
-
-/// A fastq record that ownes its data arrays.
-#[derive(Debug)]
-pub struct OwnedRecord {
-    // (start, stop), but might include \r at the end
-    head: usize,
-    seq: usize,
-    sep: usize,
-    qual: usize,
-    data: Vec<u8>,
-}
-
-#[derive(Debug)]
-struct IdxRecord {
-    head: usize,
-    seq: usize,
-    sep: usize,
-    qual: usize,
-    data: (usize, usize),
-}
-
-
-/// Remove a final '\r' from a byte slice
-#[inline]
-fn trim_winline(line: &[u8]) -> &[u8] {
-    if let Some((&b'\r', remaining)) = line.split_last() {
-        remaining
-    } else {
-        line
-    }
-}
-
-
-impl<'a> Record for RefRecord<'a> {
-    #[inline]
-    fn head(&self) -> &[u8] {
-        // skip the '@' at the beginning
-        trim_winline(&self.data[1 .. self.head])
-    }
-
-    #[inline]
-    fn seq(&self) -> &[u8] {
-        trim_winline(&self.data[self.head + 1 .. self.seq])
-    }
-
-    #[inline]
-    fn qual(&self) -> &[u8] {
-        trim_winline(&self.data[self.sep + 1 .. self.qual])
-    }
-
-    #[inline]
-    fn write<W: Write>(&self, writer: &mut W) -> Result<usize> {
-        writer.write_all(&self.data)?;
-        Ok(self.data.len())
-    }
-}
-
-
-impl Record for OwnedRecord {
-    #[inline]
-    fn head(&self) -> &[u8] {
-        // skip the '@' at the beginning
-        trim_winline(&self.data[1 .. self.head])
-    }
-
-    #[inline]
-    fn seq(&self) -> &[u8] {
-        trim_winline(&self.data[self.head + 1 .. self.seq])
-    }
-
-    #[inline]
-    fn qual(&self) -> &[u8] {
-        trim_winline(&self.data[self.sep + 1 .. self.qual])
-    }
-
-    #[inline]
-    fn write<W: Write>(&self, writer: &mut W) -> Result<usize> {
-        writer.write_all(&self.data)?;
-        Ok(self.data.len())
-    }
-}
-
-
-enum IdxRecordResult {
-    Incomplete,
-    EmptyBuffer,
-    Record(IdxRecord),
-}
-
-
-#[inline]
-fn read_header(buffer: &[u8]) -> Result<Option<usize>> {
-    match buffer.first() {
-        None => { Ok(None) },
-        Some(&b'@') => {
-            Ok(memchr(b'\n', buffer))
-        },
-        Some(_) => {
-            return Err(Error::new(ErrorKind::InvalidData,
-                                  "Fastq headers must start with '@'"))
-        }
-    }
-}
-
-
-#[inline]
-fn read_sep(buffer: &[u8]) -> Result<Option<usize>> {
-    match buffer.first() {
-        None => { return Ok(None) },
-        Some(&b'+') => { Ok(memchr(b'\n', buffer)) },
-        Some(_) => {
-            return Err(Error::new(ErrorKind::InvalidData,
-                                  "Sequence and quality not separated by +"));
-        }
-    }
-}
-
-
-impl<'a> RefRecord<'a> {
-    /// Copy the borrowed data array and return an owned record.
-    pub fn to_owned_record(&self) -> OwnedRecord {
-        OwnedRecord {
-            head: self.head,
-            seq: self.seq,
-            sep: self.sep,
-            qual: self.qual,
-            data: self.data.to_vec(),
-        }
-    }
-}
-
-impl IdxRecord {
-    #[inline]
-    fn to_ref_record<'a>(&self, buffer: &'a [u8]) -> RefRecord<'a> {
-        let data = &buffer[self.data.0..self.data.1];
-        let datalen = data.len();
-        debug_assert!(datalen == self.data.1 - self.data.0);
-
-        debug_assert!(self.head < datalen);
-        debug_assert!(self.qual < datalen);
-        debug_assert!(self.seq < datalen);
-        debug_assert!(self.sep < datalen);
-        debug_assert!(self.head < self.seq);
-        debug_assert!(self.seq < self.sep);
-        debug_assert!(self.sep < self.qual);
-
-        RefRecord {
-            data: data,
-            head: self.head,
-            seq: self.seq,
-            sep: self.sep,
-            qual: self.qual,
-        }
-    }
-
-    #[inline]
-    fn from_buffer(buffer: &[u8]) -> Result<IdxRecordResult> {
-        if buffer.len() == 0 {
-            return Ok(IdxRecordResult::EmptyBuffer);
-        }
-
-
-        let head_end = match read_header(buffer)? {
-            None => { return Ok(IdxRecordResult::Incomplete) },
-            Some(val) => val
-        };
-        let pos = head_end + 1;
-
-        let buffer_ = &buffer[pos..];
-        let seq_end = match memchr(b'\n', buffer_) {
-            None => { return Ok(IdxRecordResult::Incomplete) },
-            Some(end) => end + pos
-        };
-        let pos = seq_end + 1;
-
-        let buffer_ = &buffer[pos..];
-        let sep_end = match read_sep(buffer_)? {
-            None => { return Ok(IdxRecordResult::Incomplete) },
-            Some(end) => end + pos,
-        };
-        let pos = sep_end + 1;
-
-        let buffer_ = &buffer[pos..];
-        let qual_end = match memchr(b'\n', buffer_) {
-            None => { return Ok(IdxRecordResult::Incomplete) },
-            Some(end) => end + pos,
-        };
-
-        if qual_end - sep_end != seq_end - head_end {
-            return Err(Error::new(ErrorKind::InvalidData,
-                                  "Sequence and quality length mismatch"));
-        }
-
-        Ok(IdxRecordResult::Record(
-            IdxRecord {
-                data: (0, qual_end + 1),
-                head: head_end,
-                seq: seq_end,
-                sep: sep_end,
-                qual: qual_end,
-            }
-        ))
-    }
-}
 
 
 /// Parser for fastq files.
@@ -412,9 +172,9 @@ pub struct Parser<R: Read> {
 /// ```
 pub fn parse_path<P, F, O>(path: Option<P>, func: F) -> Result<O>
         where P: AsRef<Path>,
-              F: FnOnce(Parser<Box<&mut Read>>) -> O
+              F: FnOnce(Parser<&mut dyn Read>) -> O
 {
-    let mut reader: Box<Read + Send> = match path {
+    let mut reader: Box<dyn Read + Send> = match path {
         None => {
             Box::new(std::io::stdin())
         },
@@ -425,22 +185,28 @@ pub fn parse_path<P, F, O>(path: Option<P>, func: F) -> Result<O>
     let mut magic_bytes = [0u8; 4];
     reader.read_exact(&mut magic_bytes)?;
     let mut reader = Cursor::new(magic_bytes.to_vec()).chain(reader);
-    if &magic_bytes[..2] == b"\x1f\x8b" {
+    if unsafe { std::mem::transmute::<_, u32>(magic_bytes.clone()) }.to_le() ==  0x184D2204 {
         let bufsize = 1<<22;
         let queuelen = 2;
-        let reader = MultiGzDecoder::new(reader)?;
-        return Ok(thread_reader(bufsize, queuelen, reader, |reader| {
-            func(Parser::new(Box::new(reader)))
+        return Ok(thread_reader(bufsize, queuelen, Decoder::new(reader)?, |mut reader| {
+            func(Parser::new(&mut reader))
+        }).expect("lz4 reader thread paniced"))
+    } else if &magic_bytes[..2] == b"\x1f\x8b" {
+        let bufsize = 1<<22;
+        let queuelen = 2;
+        let reader = MultiGzDecoder::new(reader);
+        return Ok(thread_reader(bufsize, queuelen, reader, |mut reader| {
+            func(Parser::new(&mut reader))
         }).expect("gzip reader thread paniced"))
     } else if magic_bytes[0] == b'@' {
-        Ok(func(Parser::new(Box::new(&mut reader))))
+        Ok(func(Parser::new(&mut reader)))
     } else {
         return Err(Error::new(ErrorKind::InvalidData, "Not a gzip, lz4 or plain fastq file"))
     }
 }
 
 
-impl<R: Read> Parser<R> {
+impl<'a, R: 'a + Read> Parser<R> {
     /// Create a new fastq parser.
     pub fn new(reader: R) -> Parser<R> {
         Parser {
@@ -449,37 +215,94 @@ impl<R: Read> Parser<R> {
         }
     }
 
+    /// Get a RecordRefIter for this parser. Should only be used in custom iteration scenarios.
+    pub fn ref_iter(self) -> RecordRefIter<R> {
+        RecordRefIter {
+            parser: self,
+            current_length: None,
+            current: None,
+        }
+    }
+
     /// Apply a function to each fastq record in an file.
     ///
     /// Stop the parser if the closure returns `false`.
     /// Return `true`, if the parser reached the end of the file.
     #[inline]
-    pub fn each<F>(&mut self, mut func: F) -> Result<bool> where F: FnMut(RefRecord) -> bool {
+    pub fn each<F>(self, mut func: F) -> Result<bool> where F: FnMut(RefRecord) -> bool {
+        let mut iter = self.ref_iter();
         loop {
-            match IdxRecord::from_buffer(self.buffer.data())? {
-                IdxRecordResult::EmptyBuffer => {
-                    self.buffer.clean();
-                    if self.buffer.read_into(&mut self.reader)? == 0 {
-                        return Ok(true)
-                    };
-                }
-                IdxRecordResult::Incomplete => {
-                    self.buffer.clean();
-                    if self.buffer.n_free() == 0 {
-                        return Err(Error::new(ErrorKind::InvalidData,
-                                              "Fastq record is too long"));
-                    }
-                    if self.buffer.read_into(&mut self.reader)? == 0 {
-                        return Err(Error::new(ErrorKind::InvalidData,
-                                              "Possibly truncated input file."))
-                    }
-                }
-                IdxRecordResult::Record(record) => {
-                    let go_on = func(record.to_ref_record(self.buffer.data()));
-                    self.buffer.consume(record.data.1 - record.data.0);
+            iter.advance()?;
+            match iter.get() {
+                None => { return Ok(true) },
+                Some(record) => {
+                    let go_on = func(record);
                     if !go_on {
                         return Ok(false)
                     }
+                }
+            }
+        }
+    }
+}
+
+
+pub struct RecordRefIter<R: Read> {
+    parser: Parser<R>,
+    current: Option<IdxRecord>,
+    current_length: Option<usize>,
+}
+
+
+impl<R: Read> RecordRefIter<R> {
+    pub fn get(&self) -> Option<RefRecord> {
+        match self.current {
+            None => None,
+            Some(ref rec) => Some(rec.to_ref_record(self.parser.buffer.data()))
+        }
+    }
+
+    pub fn advance(&mut self) -> Result<()> {
+        let buffer = &mut self.parser.buffer;
+        let reader = &mut self.parser.reader;
+        if let Some(len) = self.current_length.take() {
+            buffer.consume(len);
+        }
+        loop {
+            match IdxRecord::from_buffer(buffer.data()) {
+                Err(e) => { return Err(e) },
+                Ok(IdxRecordResult::EmptyBuffer) => {
+                    buffer.clean();
+                    match buffer.read_into(reader) {
+                        Err(e) => { return Err(e) },
+                        Ok(0) => {
+                            self.current = None;
+                            self.current_length = None;
+                            return Ok(())
+                        },
+                        _ => { continue }
+                    }
+                },
+                Ok(IdxRecordResult::Incomplete) => {
+                    buffer.clean();
+                    if buffer.n_free() == 0 {
+                        return Err(Error::new(ErrorKind::InvalidData,
+                                              "Fastq record is too long"));
+                    }
+                    match buffer.read_into(reader) {
+                        Err(e) => { return Err(e) }
+                        Ok(0) => {
+                            return Err(Error::new(ErrorKind::InvalidData,
+                                                  "Possibly truncated input file"));
+                        },
+                        _ => { continue }
+                    }
+                },
+                Ok(IdxRecordResult::Record(record)) => {
+                    let length = record.data.1.checked_sub(record.data.0).unwrap();
+                    self.current = Some(record);
+                    self.current_length = Some(length);
+                    return Ok(());
                 }
             }
         }
@@ -517,43 +340,6 @@ impl RecordSet {
     }
 }
 
-pub struct OwnedRecordIter<R: Read> {
-    record_set_iter: RecordSetIter<R>,
-    current_record_set: Option<RecordSet>,
-    pos: usize,
-}
-
-impl<R: Read> Iterator for OwnedRecordIter<R> {
-    type Item = OwnedRecord;
-
-    #[inline]
-    fn next(&mut self) -> Option<OwnedRecord> {
-
-        if self.current_record_set.is_none() || self.current_record_set.as_ref().unwrap().records.len() == self.pos {
-            match self.record_set_iter.next() {
-                Some(Ok(rs)) => { 
-                    self.current_record_set = Some(rs);
-                    self.pos = 0;
-                },
-                _ => {
-                    self.current_record_set = None;
-                    return None;
-                }
-            }
-        }
-
-        match self.current_record_set {
-            Some(ref rs) => {       
-                let ref idx_record = rs.records[self.pos];
-                let ref_rec = idx_record.to_ref_record(&rs.buffer);
-                self.pos += 1;
-                Some(ref_rec.to_owned_record())
-            },
-            _ => None
-        }
-    }
-}
-
 
 pub struct RecordSetItems<'a> {
     idx_records: ::std::slice::Iter<'a, IdxRecord>,
@@ -576,7 +362,7 @@ impl<'a> Iterator for RecordSetItems<'a> {
 }
 
 
-pub struct RecordSetIter<R: Read> {
+struct RecordSetIter<R: Read> {
     parser: Parser<R>,
     num_records_guess: usize,
     reader_at_end: bool,
@@ -647,21 +433,11 @@ impl<R: Read> Iterator for RecordSetIter<R> {
 
 impl<R: Read> Parser<R> {
     /// Return the fastq records in chunks.
-    pub fn record_sets(self) -> RecordSetIter<R> {
+    fn record_sets(self) -> RecordSetIter<R> {
         RecordSetIter {
             parser: self,
             reader_at_end: false,
             num_records_guess: 100,
-        }
-    }
-
-    ///
-    pub fn owned_records(self) -> OwnedRecordIter<R> {
-        let rec_sets = self.record_sets();
-        OwnedRecordIter {
-            record_set_iter: rec_sets,
-            current_record_set: None,
-            pos: 0,
         }
     }
 
@@ -741,7 +517,7 @@ impl<R: Read> Parser<R> {
             S: FromIterator<O>,
             O: Send + 'static,
             F: Send + Sync + 'static,
-            F: Fn(Box<Iterator<Item=RecordSet>>) -> O,
+            F: Fn(Box<dyn Iterator<Item=RecordSet>>) -> O,
     {
         let mut senders: Vec<SyncSender<_>> = vec![];
         let mut threads: Vec<thread::JoinHandle<_>> = vec![];
@@ -797,6 +573,47 @@ impl<R: Read> Parser<R> {
 }
 
 
+/// Step through two fastq files and call a callback for pairs of Records.
+///
+/// The callback returns a tuple of bools that indicate for each parser
+/// if it should advance the iterator. This can be used to deal with
+/// single reads that are interleaved in paired sequences and would otherwise
+/// lead to misaligned pairs. Iteration ends if either both advance flags
+/// are `false` or if both iterators are exhausted.
+///
+/// The returned bool tuple indicates which parsers were exhausetd.
+pub fn each_zipped<R1, R2, F>(parser1: Parser<R1>, parser2: Parser<R2>, mut callback: F)
+    -> Result<(bool, bool)>
+    where
+        R1: Read,
+        R2: Read,
+        F: FnMut(Option<RefRecord>, Option<RefRecord>) -> (bool, bool)
+{
+    let mut iter1 = parser1.ref_iter();
+    let mut iter2 = parser2.ref_iter();
+    let mut finished = (false, false);
+    iter1.advance()?;
+    iter2.advance()?;
+    loop {
+        let advance_flags =  {
+            let val1 = if finished.0 { None } else { iter1.get() };
+            let val2 = if finished.1 { None } else { iter2.get() };
+            finished = (val1.is_none(), val2.is_none());
+            callback(val1, val2)
+        };
+        if advance_flags == (false, false) || finished == (true, true) {
+            return Ok(finished);
+        }
+        if advance_flags.0 && !finished.0 {
+            iter1.advance()?;
+        }
+        if advance_flags.1 && !finished.1 {
+            iter2.advance()?;
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Write, Seek, SeekFrom, ErrorKind};
@@ -805,7 +622,7 @@ mod tests {
     #[test]
     fn correct() {
         let data = Cursor::new(b"@hi\nNN\n+\n++\n@hallo\nTCC\n+\nabc\n");
-        let mut parser = Parser::new(data);
+        let parser = Parser::new(data);
         let mut i: u64 = 0;
         let ok = parser.each(move |record| {
             if i == 0 {
@@ -843,7 +660,7 @@ mod tests {
     #[test]
     fn empty_id() {
         let data = Cursor::new(b"@\nNN\n+\n++\n");
-        let mut parser = Parser::new(data);
+        let parser = Parser::new(data);
         parser.each(|record| {
             assert_eq!(record.head(), b"");
             assert_eq!(record.seq(), b"NN");
@@ -855,7 +672,7 @@ mod tests {
     #[test]
     fn missing_lines() {
         let data = Cursor::new(b"@hi\nNN\n+\n++\n@hi\nNN");
-        let mut parser = Parser::new(data);
+        let parser = Parser::new(data);
         let ok = parser.each(|record| {
             assert_eq!(record.head(), b"hi");
             assert_eq!(record.seq(), b"NN");
@@ -871,7 +688,7 @@ mod tests {
     #[test]
     fn truncated() {
         let data = Cursor::new(b"@hi\nNN\n+\n++");
-        let mut parser = Parser::new(data);
+        let parser = Parser::new(data);
         let ok = parser.each(|_| { assert!(false); true });
         assert!(ok.is_err());
     }
@@ -879,7 +696,7 @@ mod tests {
     #[test]
     fn second_idline() {
         let data = Cursor::new(b"@hi\nNN\n+hi\n++\n@hi\nNN\n+hi\n++\n");
-        let mut parser = Parser::new(data);
+        let parser = Parser::new(data);
         let ok = parser.each(|record| {
             assert_eq!(record.head(), b"hi");
             assert_eq!(record.seq(), b"NN");
@@ -896,7 +713,7 @@ mod tests {
     #[test]
     fn windows_lineend() {
         let data = Cursor::new(b"@hi\r\nNN\r\n+\r\n++\r\n@hi\r\nNN\r\n+\r\n++\r\n");
-        let mut parser = Parser::new(data);
+        let parser = Parser::new(data);
         let ok = parser.each(|record| {
             assert_eq!(record.head(), b"hi");
             assert_eq!(record.seq(), b"NN");
@@ -909,7 +726,7 @@ mod tests {
     #[test]
     fn length_mismatch() {
         let data = Cursor::new(b"@hi\nNN\n+\n+\n");
-        let mut parser = Parser::new(data);
+        let parser = Parser::new(data);
         let ok = parser.each(|_| { assert!(false); true });
         assert!(ok.is_err());
     }
@@ -922,10 +739,31 @@ mod tests {
             data.write(b"longid").unwrap();
         };
         data.seek(SeekFrom::Start(0)).unwrap();
-        let mut parser = Parser::new(data);
+        let parser = Parser::new(data);
         assert!(parser.each(|_| true).is_err());
     }
 
+    #[test]
+    fn bufflen() {
+        let mut data: Cursor<Vec<u8>> = Cursor::new(vec![]);
+        data.write(b"@").unwrap();
+        for _ in 0..(super::BUFSIZE - 8) {
+            data.write(b"a").unwrap();
+        };
+        data.write(b"\nA\n+\nB\n").unwrap();
+        data.seek(SeekFrom::Start(0)).unwrap();
+        let parser = Parser::new(data);
+        let vals: Vec<u64> = parser.parallel_each(2, |sets| {
+            let mut count = 0;
+            for set in sets {
+                for _ in set.iter() {
+                    count += 1;
+                }
+            }
+            count
+        }).unwrap();
+        assert!(vals.iter().sum::<u64>() == 1);
+    }
 
     #[test]
     fn refset() {

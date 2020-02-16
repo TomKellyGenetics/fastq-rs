@@ -50,21 +50,18 @@ impl Buffer {
     }
 
     /// Move data to the start of the buffer, freeing space at the end.
-    ///
-    /// Return the amount of *aditional* free space.
-    pub fn clean(&mut self) -> usize {
+    pub fn clean(&mut self) {
         if self.start == 0 {
-            return 0
+            return
         }
 
-        let old_free = self.n_free();
         let n_in_buffer = self.len();
         let new_end = (n_in_buffer + 15) & !0x0f;  // make sure next read is aligned
         let new_start = new_end.checked_sub(n_in_buffer).unwrap();
 
         // Never move the data forward in the buffer
         if new_start >= self.start {
-            return 0;
+            return;
         }
 
         let dest = self.data[new_start..].as_mut_ptr();
@@ -73,8 +70,6 @@ impl Buffer {
         unsafe { ::std::ptr::copy(src, dest, n_in_buffer); }
         self.start = new_start;
         self.end = new_end;
-
-        self.n_free().checked_sub(old_free).unwrap()
     }
 
     pub fn read_into<R: Read>(&mut self, reader: &mut R) -> Result<usize> {
