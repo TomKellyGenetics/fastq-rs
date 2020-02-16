@@ -60,7 +60,7 @@ impl Buffer {
         let new_start = new_end.checked_sub(n_in_buffer).unwrap();
 
         if new_start >= self.start {
-            return 0;
+            return;
         }
 
         let dest = self.data[new_start..].as_mut_ptr();

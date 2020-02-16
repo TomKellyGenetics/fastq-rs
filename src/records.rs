@@ -102,15 +102,15 @@ impl<'a> Record for RefRecord<'a> {
 impl Record for OwnedRecord {
     fn head(&self) -> &[u8] {
         // skip the '@' at the beginning
-        &self.head
+        trim_winline(&self.data[1 .. self.head])
     }
 
     fn seq(&self) -> &[u8] {
-        &self.seq
+        trim_winline(&self.data[self.head + 1 .. self.seq])
     }
 
     fn qual(&self) -> &[u8] {
-        &self.qual
+        trim_winline(&self.data[self.sep + 1 .. self.qual])
     }
 
     fn write<W: Write>(&self, writer: &mut W) -> Result<usize> {
